@@ -643,13 +643,13 @@ static bool zh_bme280_read(int32_t *temperature, int32_t *pressure, int32_t *hum
 
 static float zh_bme280_compensate_temperature(int32_t adc_t)
 {
-    int32_t dig_t1 = (int32_t)(bme280_calib[1] << 8 | bme280_calib[0]);
+    int32_t dig_t1 = (int32_t)(uint16_t)(bme280_calib[1] << 8 | bme280_calib[0]);
     int32_t dig_t2 = (int16_t)(bme280_calib[3] << 8 | bme280_calib[2]);
     int32_t dig_t3 = (int16_t)(bme280_calib[5] << 8 | bme280_calib[4]);
     int32_t var1 = ((((adc_t >> 3) - (dig_t1 << 1))) * dig_t2) >> 11;
     int32_t var2 = (((((adc_t >> 4) - dig_t1) * ((adc_t >> 4) - dig_t1)) >> 12) * dig_t3) >> 14;
     bme280_t_fine = var1 + var2;
-    return (float)((bme280_t_fine * 5 + 128) >> 8) / 100.0f;
+    return (float)((bme280_t_fine * 5 + 128) >> 8) / 100.0;
 }
 
 static float zh_bme280_compensate_pressure(int32_t adc_p)
