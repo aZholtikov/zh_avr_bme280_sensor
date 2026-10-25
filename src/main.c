@@ -6,7 +6,7 @@
 #include "util/delay.h"
 #include "stdbool.h"
 #include "math.h"
-#include "zh_rf_config.h"
+#include "zh_nrf24_config.h"
 
 #if defined(__AVR_ATmega328PB__)
 #ifndef SPCR
@@ -496,11 +496,11 @@ static uint8_t bme280_calib[33] = {0};
 static int32_t bme280_t_fine = 0;
 static bool bme280_present = false;
 
-zh_rf_sensor_transmitted_data_t transmitted_data = {0};
+zh_nrf24_sensor_transmitted_data_t transmitted_data = {0};
 
 int main(void)
 {
-    transmitted_data.type = ZH_RF_SENSOR_BME280;
+    transmitted_data.type = ZH_NRF24_SENSOR_BME280;
     MCUSR &= ~(1 << WDRF);
     wdt_disable();
     cli();
@@ -517,8 +517,8 @@ int main(void)
     }
     transmitted_data.id = (int16_t)device_id;
     {
-        uint8_t probe[ZH_RF_MAX_PAYLOAD_SIZE];
-        if (zh_rf_sensor_build_payload(&transmitted_data, probe, sizeof(probe)) == 0)
+        uint8_t probe[ZH_NRF24_MAX_PAYLOAD_SIZE];
+        if (zh_nrf24_sensor_build_payload(&transmitted_data, probe, sizeof(probe)) == 0)
         {
             zh_enter_final_sleep();
         }
@@ -535,8 +535,8 @@ int main(void)
             transmitted_data.value_2 = (int16_t)lroundf(zh_bme280_compensate_temperature(adc_t) * 10.0);
             transmitted_data.value_3 = (int16_t)lroundf(zh_bme280_compensate_pressure(adc_p) * 0.00750062 * 10.0);
             transmitted_data.value_1 = (int16_t)lroundf(zh_bme280_compensate_humidity(adc_h) * 10.0);
-            uint8_t payload[ZH_RF_MAX_PAYLOAD_SIZE];
-            uint8_t size = zh_rf_sensor_build_payload(&transmitted_data, payload, sizeof(payload));
+            uint8_t payload[ZH_NRF24_MAX_PAYLOAD_SIZE];
+            uint8_t size = zh_nrf24_sensor_build_payload(&transmitted_data, payload, sizeof(payload));
             if (size > 0)
             {
                 zh_nrf24_send(payload, size);
@@ -567,8 +567,8 @@ int main(void)
                     transmitted_data.value_2 = (int16_t)lroundf(zh_bme280_compensate_temperature(adc_t));
                     transmitted_data.value_3 = (int16_t)lroundf(zh_bme280_compensate_pressure(adc_p) * 0.00750062);
                     transmitted_data.value_1 = (int16_t)lroundf(zh_bme280_compensate_humidity(adc_h));
-                    uint8_t payload[ZH_RF_MAX_PAYLOAD_SIZE];
-                    uint8_t size = zh_rf_sensor_build_payload(&transmitted_data, payload, sizeof(payload));
+                    uint8_t payload[ZH_NRF24_MAX_PAYLOAD_SIZE];
+                    uint8_t size = zh_nrf24_sensor_build_payload(&transmitted_data, payload, sizeof(payload));
                     if (size > 0)
                     {
                         zh_nrf24_send(payload, size);
@@ -1070,25 +1070,25 @@ static uint16_t zh_get_random_token(void)
 static uint8_t zh_do_pairing(void)
 {
     uint16_t token = zh_get_random_token();
-    zh_rf_sensor_pairing_data_t pairing_request;
+    zh_nrf24_sensor_pairing_data_t pairing_request;
     pairing_request.type = (uint8_t)transmitted_data.type;
-    pairing_request.magic = ZH_RF_PAIRING_REQ_MAGIC;
+    pairing_request.magic = ZH_NRF24_PAIRING_REQ_MAGIC;
     pairing_request.token_hi = (uint8_t)(token >> 8);
     pairing_request.token_lo = (uint8_t)(token & 0xFF);
     pairing_request.id = 0;
     zh_nrf24_interrupt_init();
-    zh_rf_sensor_pairing_state_t state = ZH_RF_PAIR_SEND;
+    zh_nrf24_sensor_pairing_state_t state = ZH_NRF24_PAIR_SEND;
     uint8_t attempts = 0;
     for (;;)
     {
         switch (state)
         {
-        case ZH_RF_PAIR_SEND:
+        case ZH_NRF24_PAIR_SEND:
             nrf_event = false;
-            zh_nrf24_send_no_wait((uint8_t *)&pairing_request, ZH_RF_PAIRING_PACKET_SIZE);
-            state = ZH_RF_PAIR_TX_WAIT;
+            zh_nrf24_send_no_wait((uint8_t *)&pairing_request, ZH_NRF24_PAIRING_PACKET_SIZE);
+            state = ZH_NRF24_PAIR_TX_WAIT;
             break;
-        case ZH_RF_PAIR_TX_WAIT:
+        case ZH_NRF24_PAIR_TX_WAIT:
             if ((PIND & (1 << PD2)) == 0)
             {
                 nrf_event = true;
@@ -1112,19 +1112,19 @@ static uint8_t zh_do_pairing(void)
                 if ((status & NRF_STATUS_TX_DS) != 0)
                 {
                     zh_nrf24_enter_rx();
-                    state = ZH_RF_PAIR_RX_WAIT;
+                    state = ZH_NRF24_PAIR_RX_WAIT;
                 }
                 else
                 {
-                    state = ZH_RF_PAIR_BACKOFF;
+                    state = ZH_NRF24_PAIR_BACKOFF;
                 }
             }
             else
             {
-                state = ZH_RF_PAIR_BACKOFF;
+                state = ZH_NRF24_PAIR_BACKOFF;
             }
             break;
-        case ZH_RF_PAIR_RX_WAIT:
+        case ZH_NRF24_PAIR_RX_WAIT:
             if ((PIND & (1 << PD2)) == 0)
             {
                 nrf_event = true;
@@ -1147,27 +1147,27 @@ static uint8_t zh_do_pairing(void)
                 if ((status & NRF_STATUS_RX_DR) != 0)
                 {
                     uint8_t width = zh_nrf24_read_payload_width();
-                    if (width > ZH_RF_MAX_PAYLOAD_SIZE)
+                    if (width > ZH_NRF24_MAX_PAYLOAD_SIZE)
                     {
                         zh_nrf24_send_command(NRF_CMD_FLUSH_RX);
                         zh_nrf24_write_register(NRF_REG_STATUS, NRF_STATUS_RX_DR);
-                        state = ZH_RF_PAIR_BACKOFF;
+                        state = ZH_NRF24_PAIR_BACKOFF;
                         break;
                     }
-                    if (width != ZH_RF_PAIRING_PACKET_SIZE)
+                    if (width != ZH_NRF24_PAIRING_PACKET_SIZE)
                     {
-                        uint8_t dummy[ZH_RF_MAX_PAYLOAD_SIZE];
+                        uint8_t dummy[ZH_NRF24_MAX_PAYLOAD_SIZE];
                         zh_nrf24_read_payload(dummy, width);
                         zh_nrf24_write_register(NRF_REG_STATUS, NRF_STATUS_RX_DR);
                         zh_nrf24_send_command(NRF_CMD_FLUSH_RX);
-                        state = ZH_RF_PAIR_BACKOFF;
+                        state = ZH_NRF24_PAIR_BACKOFF;
                         break;
                     }
-                    zh_rf_sensor_pairing_data_t pairing_response;
+                    zh_nrf24_sensor_pairing_data_t pairing_response;
                     zh_nrf24_read_payload((uint8_t *)&pairing_response, width);
                     zh_nrf24_write_register(NRF_REG_STATUS, NRF_STATUS_RX_DR | NRF_STATUS_TX_DS | NRF_STATUS_MAX_RT);
                     zh_nrf24_send_command(NRF_CMD_FLUSH_RX);
-                    if (pairing_response.magic == ZH_RF_PAIRING_ACK_MAGIC && pairing_response.type == pairing_request.type &&
+                    if (pairing_response.magic == ZH_NRF24_PAIRING_ACK_MAGIC && pairing_response.type == pairing_request.type &&
                         pairing_response.token_hi == pairing_request.token_hi && pairing_response.token_lo == pairing_request.token_lo &&
                         pairing_response.id != 0 && pairing_response.id != DEVICE_ID_UNASSIGNED)
                     {
@@ -1177,14 +1177,14 @@ static uint8_t zh_do_pairing(void)
                         return pairing_response.id;
                     }
                 }
-                state = ZH_RF_PAIR_BACKOFF;
+                state = ZH_NRF24_PAIR_BACKOFF;
             }
             else
             {
-                state = ZH_RF_PAIR_BACKOFF;
+                state = ZH_NRF24_PAIR_BACKOFF;
             }
             break;
-        case ZH_RF_PAIR_BACKOFF:
+        case ZH_NRF24_PAIR_BACKOFF:
             zh_nrf24_enter_power_down();
             nrf_event = false;
             zh_wdt_start(WDT_T_4S);
@@ -1198,7 +1198,7 @@ static uint8_t zh_do_pairing(void)
             {
                 zh_enter_final_sleep();
             }
-            state = ZH_RF_PAIR_SEND;
+            state = ZH_NRF24_PAIR_SEND;
             break;
         }
     }

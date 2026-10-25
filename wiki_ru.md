@@ -23,31 +23,31 @@
 
 ### Структура данных
 
-Компонент не использует динамическое выделение памяти. Сырые показания хранятся в статических переменных, калибровочные коэффициенты BME280 — в массиве `bme280_calib[33]`. Перед передачей данные сериализуются функцией `zh_rf_sensor_build_payload()` из внешней библиотеки `zh_rf_config` в буфер `uint8_t[ZH_RF_MAX_PAYLOAD_SIZE]` (32 байта) в формате little-endian.
+Компонент не использует динамическое выделение памяти. Сырые показания хранятся в статических переменных, калибровочные коэффициенты BME280 — в массиве `bme280_calib[33]`. Перед передачей данные сериализуются функцией `zh_nrf24_sensor_build_payload()` из внешней библиотеки `zh_nrf24_config` в буфер `uint8_t[ZH_NRF24_MAX_PAYLOAD_SIZE]` (32 байта) в формате little-endian.
 
 #### Формат передаваемого пакета
 
-Данные формируются в глобальной переменной `transmitted_data` типа `zh_rf_sensor_transmitted_data_t` из библиотеки `zh_rf_config`, затем сериализуются в полезную нагрузку. Для типа `ZH_RF_SENSOR_BME280` полный размер пакета — 12 байт (заголовок id + type + battery и три поля измерений, каждое `int16_t` в little-endian).
+Данные формируются в глобальной переменной `transmitted_data` типа `zh_nrf24_sensor_transmitted_data_t` из библиотеки `zh_nrf24_config`, затем сериализуются в полезную нагрузку. Для типа `ZH_NRF24_SENSOR_BME280` полный размер пакета — 12 байт (заголовок id + type + battery и три поля измерений, каждое `int16_t` в little-endian).
 
 | Поле | Тип | Описание |
 | ------ | ----- | ---------- |
 | `id` | `int16_t` | Идентификатор устройства, назначенный шлюзом при сопряжении |
-| `type` | `int16_t` | Тип устройства (`ZH_RF_SENSOR_BME280`) |
+| `type` | `int16_t` | Тип устройства (`ZH_NRF24_SENSOR_BME280`) |
 | `battery` | `int16_t` | Напряжение батареи × 100 (например, 330 = 3.30 В) |
 | `value_1` | `int16_t` | Влажность (% × 10, например 453 = 45.3 %) |
 | `value_2` | `int16_t` | Температура (°C × 10, например 253 = 25.3 °C) |
 | `value_3` | `int16_t` | Давление (мм рт. ст. × 10) |
 
-Тип устройства задаётся значением перечисления `ZH_RF_SENSOR_BME280` из библиотеки `zh_rf_config`.
+Тип устройства задаётся значением перечисления `ZH_NRF24_SENSOR_BME280` из библиотеки `zh_nrf24_config`.
 
 #### Формат пакета сопряжения
 
-Пакет сопряжения — структура `zh_rf_sensor_pairing_data_t` (5 байт, `ZH_RF_PAIRING_PACKET_SIZE`):
+Пакет сопряжения — структура `zh_nrf24_sensor_pairing_data_t` (5 байт, `ZH_NRF24_PAIRING_PACKET_SIZE`):
 
 | Поле | Тип | Описание |
 | ------ | ----- | ---------- |
-| `type` | `uint8_t` | Тип датчика (код `ZH_RF_SENSOR_BME280`) |
-| `magic` | `uint8_t` | Маркер направления: `ZH_RF_PAIRING_REQ_MAGIC` (0xA5) в запросе, `ZH_RF_PAIRING_ACK_MAGIC` (0x5A) в ответе |
+| `type` | `uint8_t` | Тип датчика (код `ZH_NRF24_SENSOR_BME280`) |
+| `magic` | `uint8_t` | Маркер направления: `ZH_NRF24_PAIRING_REQ_MAGIC` (0xA5) в запросе, `ZH_NRF24_PAIRING_ACK_MAGIC` (0x5A) в ответе |
 | `token_hi` | `uint8_t` | Старший байт псевдослучайного токена |
 | `token_lo` | `uint8_t` | Младший байт псевдослучайного токена |
 | `id` | `uint8_t` | Идентификатор, назначенный шлюзом (в ответе) |
@@ -169,14 +169,14 @@
 ### Алгоритм загрузки идентификатора и сопряжения
 
 - При старте читается ID из EEPROM (`eeprom_read_byte`, адрес `0x00`); значения `0x00` и `0xFF` считаются признаком несопряжённого устройства.
-- При отсутствии ID выполняется `zh_do_pairing()` — неблокирующая машина состояний (`ZH_RF_PAIR_SEND` → `ZH_RF_PAIR_TX_WAIT` → `ZH_RF_PAIR_RX_WAIT` → `ZH_RF_PAIR_BACKOFF`):
+- При отсутствии ID выполняется `zh_do_pairing()` — неблокирующая машина состояний (`ZH_NRF24_PAIR_SEND` → `ZH_NRF24_PAIR_TX_WAIT` → `ZH_NRF24_PAIR_RX_WAIT` → `ZH_NRF24_PAIR_BACKOFF`):
   - генерируется токен (`zh_get_random_token()` из MCUSR и шума АЦП);
-  - отправляется запрос `zh_rf_sensor_pairing_data_t` (magic `0xA5`) без ожидания (`zh_nrf24_send_no_wait`);
+  - отправляется запрос `zh_nrf24_sensor_pairing_data_t` (magic `0xA5`) без ожидания (`zh_nrf24_send_no_wait`);
   - после TX_DS трансивер переводится в RX-режим, ожидание ответа со сном и WDT-таймаутом 250 мс;
   - ответ валидируется по magic `0x5A`, типу, токену и ненулевому ID; ширина пакета проверяется через `R_RX_PL_WID`;
   - при неудаче — backoff-пауза ~4 с (WDT), не более `PAIRING_TIMEOUT_ATTEMPTS` (7) попыток.
 - Назначенный ID сохраняется в EEPROM и записывается в `transmitted_data.id`.
-- После инициализации выполняется пробная сборка пакета `zh_rf_sensor_build_payload()`; при нулевом результате (неизвестный тип) — переход в постоянный сон.
+- После инициализации выполняется пробная сборка пакета `zh_nrf24_sensor_build_payload()`; при нулевом результате (неизвестный тип) — переход в постоянный сон.
 
 ### Алгоритм инициализации BME280
 
@@ -210,7 +210,7 @@
 - Переход в Power Up (бит `PWR_UP` в CONFIG).
 - Ожидание 5 мс (время стартования осциллятора).
 - Очистка TX FIFO командой `FLUSH_TX`.
-- Загрузка полезной нагрузки командой `W_TX_PAYLOAD` (размер пакета определяет `zh_rf_sensor_build_payload()`, динамические пакеты включены: `FEATURE = EN_DPL`, `DYNPD = DPL_P0`).
+- Загрузка полезной нагрузки командой `W_TX_PAYLOAD` (размер пакета определяет `zh_nrf24_sensor_build_payload()`, динамические пакеты включены: `FEATURE = EN_DPL`, `DYNPD = DPL_P0`).
 - Импульс CE для запуска передачи.
 - Ожидание завершения по пину IRQ (PD2) с таймаутом ~100 мс.
 - Сброс флагов статуса, очистка FIFO, переход в Power Down.
@@ -235,7 +235,7 @@
 ```c
 int main(void)
 {
-    transmitted_data.type = ZH_RF_SENSOR_BME280;
+    transmitted_data.type = ZH_NRF24_SENSOR_BME280;
     MCUSR &= ~(1 << WDRF);
     wdt_disable();
     cli();
@@ -266,8 +266,8 @@ int main(void)
                 (int16_t)lroundf(zh_bme280_compensate_pressure(adc_p) * 0.00750062 * 10.0);
             transmitted_data.value_1 =
                 (int16_t)lroundf(zh_bme280_compensate_humidity(adc_h) * 10.0);
-            uint8_t payload[ZH_RF_MAX_PAYLOAD_SIZE];
-            uint8_t size = zh_rf_sensor_build_payload(&transmitted_data,
+            uint8_t payload[ZH_NRF24_MAX_PAYLOAD_SIZE];
+            uint8_t size = zh_nrf24_sensor_build_payload(&transmitted_data,
                                                       payload, sizeof(payload));
             if (size > 0) {
                 zh_nrf24_send(payload, size);
@@ -297,8 +297,8 @@ int main(void)
                         (int16_t)lroundf(zh_bme280_compensate_pressure(adc_p) * 0.00750062);
                     transmitted_data.value_1 =
                         (int16_t)lroundf(zh_bme280_compensate_humidity(adc_h));
-                    uint8_t payload[ZH_RF_MAX_PAYLOAD_SIZE];
-                    uint8_t size = zh_rf_sensor_build_payload(&transmitted_data,
+                    uint8_t payload[ZH_NRF24_MAX_PAYLOAD_SIZE];
+                    uint8_t size = zh_nrf24_sensor_build_payload(&transmitted_data,
                                                               payload, sizeof(payload));
                     if (size > 0) {
                         zh_nrf24_send(payload, size);
@@ -320,7 +320,7 @@ int main(void)
 // обнулите ячейку EEPROM.
 #define GATEWAY_CHANNEL 120
 #define GATEWAY_ADDRESS 0xDDEEFF
-// Тип устройства задаётся перечислением ZH_RF_SENSOR_BME280
+// Тип устройства задаётся перечислением ZH_NRF24_SENSOR_BME280
 ```
 
 ### Подключение по SPI и I2C (схема выводов)
@@ -362,7 +362,7 @@ int main(void)
 | Превышение таймаута передачи (~100 мс) | Цикл ожидания IRQ прерывается, передача может быть неполной |
 | Нет ответа шлюза при сопряжении | После 7 попыток (`PAIRING_TIMEOUT_ATTEMPTS`) — переход в постоянный сон до сброса |
 | Ширина принятого пакета ≠ 5 байт / > 32 байт | FIFO очищается, состояние сопряжения переходит в backoff |
-| `zh_rf_sensor_build_payload()` вернул 0 | Неизвестный тип датчика или слишком мал буфер — переход в постоянный сон |
+| `zh_nrf24_sensor_build_payload()` вернул 0 | Неизвестный тип датчика или слишком мал буфер — переход в постоянный сон |
 
 ---
 
@@ -385,7 +385,7 @@ int main(void)
 
 - PlatformIO с плагином `platform-atmelavr`
 - AVR-GCC (входит в состав PlatformIO)
-- Библиотека `zh_rf_config` (ветка `dev`, подключается через `lib_deps` в `platformio.ini`)
+- Библиотека `zh_nrf24_config` (ветка `dev`, подключается через `lib_deps` в `platformio.ini`)
 - Программатор USBasp (или совместимый)
 - Фьюзы: LFUSE=`0xE2`, HFUSE=`0xDF`, EFUSE=`0x07` (8 МГц, без делителя)
 
@@ -401,12 +401,12 @@ pio run -e ATmega328P -t upload
 
 ### Подключение в проекте
 
-Компонент является самодостаточной прошивкой — не подключается как библиотека. Для интеграции в другой проект скопируйте `src/main.c`, добавьте зависимость `zh_rf_config` и адаптируйте макросы конфигурации.
+Компонент является самодостаточной прошивкой — не подключается как библиотека. Для интеграции в другой проект скопируйте `src/main.c`, добавьте зависимость `zh_nrf24_config` и адаптируйте макросы конфигурации.
 
 ```ini
 ; platformio.ini
 lib_deps =
-    https://github.com/aZholtikov/zh_rf_config#dev
+    https://github.com/aZholtikov/zh_nrf24_config#dev
 ```
 
 ```c
@@ -419,5 +419,5 @@ lib_deps =
 #include "util/delay.h"
 #include "stdbool.h"
 #include "math.h"
-#include "zh_rf_config.h"
+#include "zh_nrf24_config.h"
 ```
