@@ -43,9 +43,14 @@
 #endif
 #endif
 
+#define BATTERY_VOLTAGE_CALIBRATION 1.0
+#define TEMPERATURE_CALIBRATION 0.0
+#define PRESSURE_CALIBRATION 0.0
+#define HUMIDITY_CALIBRATION 0.0
+
 #define GATEWAY_CHANNEL 120
 #define GATEWAY_ADDRESS 0xDDEEFF
-#define DEVICE_ID 6
+#define DEVICE_ID 5
 
 #define WDT_WAKE_COUNT 38
 #define ZH_TWI_TWBR 32
@@ -397,9 +402,9 @@ int main(void)
         if (zh_bme280_read(&adc_t, &adc_p, &adc_h) == true)
         {
             transmitted_data.battery_voltage = (int16_t)lroundf(zh_get_battery_voltage() * 100.0);
-            transmitted_data.value_2 = (int16_t)lroundf(zh_bme280_compensate_temperature(adc_t));
-            transmitted_data.value_3 = (int16_t)lroundf(zh_bme280_compensate_pressure(adc_p) * 0.00750062);
-            transmitted_data.value_1 = (int16_t)lroundf(zh_bme280_compensate_humidity(adc_h));
+            transmitted_data.value_2 = (int16_t)lroundf(zh_bme280_compensate_temperature(adc_t) + TEMPERATURE_CALIBRATION);
+            transmitted_data.value_3 = (int16_t)lroundf(zh_bme280_compensate_pressure(adc_p) * 0.00750062 + PRESSURE_CALIBRATION);
+            transmitted_data.value_1 = (int16_t)lroundf(zh_bme280_compensate_humidity(adc_h) + HUMIDITY_CALIBRATION);
             zh_nrf24_send((uint8_t *)&transmitted_data, sizeof(transmitted_data));
         }
         else
@@ -424,9 +429,9 @@ int main(void)
                 if (zh_bme280_read(&adc_t, &adc_p, &adc_h) == true)
                 {
                     transmitted_data.battery_voltage = (int16_t)lroundf(zh_get_battery_voltage() * 100.0);
-                    transmitted_data.value_2 = (int16_t)lroundf(zh_bme280_compensate_temperature(adc_t));
-                    transmitted_data.value_3 = (int16_t)lroundf(zh_bme280_compensate_pressure(adc_p) * 0.00750062);
-                    transmitted_data.value_1 = (int16_t)lroundf(zh_bme280_compensate_humidity(adc_h));
+                    transmitted_data.value_2 = (int16_t)lroundf(zh_bme280_compensate_temperature(adc_t) + TEMPERATURE_CALIBRATION);
+                    transmitted_data.value_3 = (int16_t)lroundf(zh_bme280_compensate_pressure(adc_p) * 0.00750062 + PRESSURE_CALIBRATION);
+                    transmitted_data.value_1 = (int16_t)lroundf(zh_bme280_compensate_humidity(adc_h) + HUMIDITY_CALIBRATION);
                     zh_nrf24_send((uint8_t *)&transmitted_data, sizeof(transmitted_data));
                 }
                 else
@@ -823,5 +828,5 @@ static float zh_get_battery_voltage(void)
     {
         return 0.0;
     }
-    return (1024.0 * 1.1) / (float)adc;
+    return ((1024.0 * 1.1) / (float)adc) * BATTERY_VOLTAGE_CALIBRATION;
 }
