@@ -16,6 +16,19 @@
 2. Changing gateway address or channel requires reflashing the microcontroller.
 3. The watchdog timer interval is fixed at 8 seconds; the sensor transmits every 38 ticks (~5 minutes).
 
+## Calibration
+
+The firmware supports calibration offsets for all sensor readings. Calibration values are defined as macros in `src/zh_avr_bme280_sensor.c`:
+
+| Macro | Default | Unit | Description |
+| --- | --- | --- | --- |
+| `BATTERY_VOLTAGE_CALIBRATION` | `1.0` | ratio | Voltage scaling factor (multiply measured voltage) |
+| `TEMPERATURE_CALIBRATION` | `0.0` | °C | Temperature offset |
+| `PRESSURE_CALIBRATION` | `0.0` | Pa | Pressure offset |
+| `HUMIDITY_CALIBRATION` | `0.0` | % | Humidity offset |
+
+To calibrate, measure the sensor readings against a reference instrument and adjust the corresponding macro values. After changing calibration values, recompile and reflash the firmware.
+
 ## Using
 
 In an existing PlatformIO project, run the following command to install the firmware:
