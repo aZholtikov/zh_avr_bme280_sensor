@@ -49,7 +49,6 @@
 #define HUMIDITY_CALIBRATION 0.0
 
 #define GATEWAY_CHANNEL 120
-#define GATEWAY_ADDRESS 0xDDEEFF
 #define DEVICE_ID 5
 
 #define WDT_WAKE_COUNT 38
@@ -96,16 +95,21 @@
  * values WDP3 and WDP0, enables the watchdog interrupt, and clears the
  * MCU reset flag. The watchdog interrupt service routine increments
  * wdt_wake_count on each trigger.
+ *
+ * Note: this function intentionally does not enable global interrupts
+ * itself; the caller is expected to call sei() once all peripherals
+ * have been initialized.
  */
 static void zh_wdt_init(void);
 
 /**
  * @brief Initialize the hardware TWI (I2C) peripheral.
  *
- * Configures PC4 (SDA) and PC5 (SCL) as inputs with pull-up enabled,
- * sets the TWI bit-rate register (TWBR) and enables the TWI module
- * in master mode. The hardware TWI is used for communication with
- * the BME280 sensor.
+ * Configures PC4 (SDA) and PC5 (SCL) as inputs with internal pull-up
+ * enabled, sets the TWI bit-rate register (TWBR) and enables the TWI
+ * module in master mode. Note: internal pull-ups are typically too weak
+ * for a reliable I2C bus; external 4.7-10 kOhm resistors are recommended.
+ * The hardware TWI is used for communication with the BME280 sensor.
  */
 static void zh_i2c_init(void);
 
@@ -156,22 +160,30 @@ static bool zh_i2c_write(uint8_t data);
 /**
  * @brief Read one byte from the TWI bus and send an ACK after reading.
  *
- * Enables the acknowledge bit (TWEA), triggers the read cycle and
- * returns the contents of TWDR. Returns 0xFF on timeout.
+ * Enables the acknowledge bit (TWEA), triggers the read cycle, verifies
+ * the status code (0x50 = data received, ACK returned) and stores the
+ * received byte in *out.
  *
- * @return Received byte
+ * @param out Pointer to store the received byte (must not be NULL)
+ *
+ * @return true on success
+ * @return false on timeout or unexpected status
  */
-static uint8_t zh_i2c_read_ack(void);
+static bool zh_i2c_read_ack(uint8_t *out);
 
 /**
  * @brief Read one byte from the TWI bus and send a NACK after reading.
  *
- * Disables the acknowledge bit, triggers the read cycle and returns
- * the contents of TWDR. Returns 0xFF on timeout.
+ * Disables the acknowledge bit, triggers the read cycle, verifies the
+ * status code (0x58 = data received, NACK returned) and stores the
+ * received byte in *out.
  *
- * @return Received byte
+ * @param out Pointer to store the received byte (must not be NULL)
+ *
+ * @return true on success
+ * @return false on timeout or unexpected status
  */
-static uint8_t zh_i2c_read_nack(void);
+static bool zh_i2c_read_nack(uint8_t *out);
 
 /**
  * @brief Write a register value to the BME280 sensor over TWI.
@@ -193,16 +205,39 @@ static bool zh_bme280_write_reg(uint8_t reg, uint8_t value);
  *
  * Performs a repeated-start transaction: writes the register address
  * then reads the specified number of bytes, sending ACK for each byte
- * except the last one, where a NACK is sent.
+ * except the last one, where a NACK is sent. Any TWI error (timeout or
+ * unexpected status code) aborts the transaction and returns false.
  *
  * @param reg Register address to read from
  * @param buf Pointer to the buffer where the data will be stored (must not be NULL)
- * @param len Number of bytes to read
+ * @param len Number of bytes to read (must be >= 1)
  *
  * @return true on success
  * @return false if any start condition or byte transfer failed
  */
 static bool zh_bme280_read_reg(uint8_t reg, uint8_t *buf, uint8_t len);
+
+/**
+ * @brief Read a little-endian unsigned 16-bit value from a byte buffer.
+ *
+ * Combines two consecutive bytes arithmetically instead of reinterpreting
+ * the buffer through a wider pointer type, so the code stays compliant
+ * with strict-aliasing rules.
+ *
+ * @param p Pointer to the first byte (low byte) of the value (must not be NULL)
+ *
+ * @return Assembled 16-bit unsigned value
+ */
+static uint16_t zh_read_u16(const uint8_t *p);
+
+/**
+ * @brief Read a little-endian signed 16-bit value from a byte buffer.
+ *
+ * @param p Pointer to the first byte (low byte) of the value (must not be NULL)
+ *
+ * @return Assembled 16-bit signed value
+ */
+static int16_t zh_read_s16(const uint8_t *p);
 
 /**
  * @brief Initialize the BME280 sensor and read calibration data.
@@ -272,10 +307,11 @@ static float zh_bme280_compensate_humidity(int32_t adc_h);
 /**
  * @brief Initialize the SPI peripheral for nRF24L01 communication.
  *
- * Configures PB2 (CE), PB3 (MISO), and PB5 (SCK) as output, sets PB2
- * high, and configures the SPI peripheral for master mode with Fck/2
- * clock divider. The SS pin is not managed by hardware and must be
- * controlled manually via PB2.
+ * Configures PB2 (CSN), PB3 (MOSI) and PB5 (SCK) as outputs, leaves PB2
+ * high (CSN idle), and configures the SPI peripheral for master mode with
+ * Fck/16 clock divider (SPR0 = 1, SPI2X = 0). CE (PB1) is configured
+ * separately in zh_nrf24_init(). The SS pin is not managed by hardware
+ * and must be controlled manually via PB2.
  */
 static void zh_spi_init(void);
 
@@ -303,15 +339,15 @@ static void zh_nrf24_init(void);
 /**
  * @brief Transmit a packet via the nRF24L01 module.
  *
- * Powers up the radio, flushes the TX FIFO, writes the payload, asserts
- * CE high to trigger transmission, waits for the IRQ line, then deasserts
- * CE. The status register is read, cleared, and the TX FIFO is flushed
- * again after transmission.
+ * Powers up the radio, clears stale STATUS flags, flushes the TX FIFO,
+ * writes the payload, asserts CE high to trigger transmission, waits for
+ * the IRQ line, then deasserts CE. After transmission the STATUS flags
+ * for TX_DS/MAX_RT/RX_DR are cleared, and the module is powered down.
  *
- * @param buf Pointer to the data buffer to transmit (must not be NULL)
- * @param size Number of bytes to transmit
+ * @param buf Pointer to the data buffer to transmit (read-only, must not be NULL)
+ * @param size Number of bytes to transmit (must be <= 32)
  */
-static void zh_nrf24_send(uint8_t *buf, uint8_t size);
+static void zh_nrf24_send(const uint8_t *buf, uint8_t size);
 
 /**
  * @brief Write a payload to the nRF24L01 using a write command.
@@ -320,12 +356,12 @@ static void zh_nrf24_send(uint8_t *buf, uint8_t size);
  * then deasserts CSN. Returns the status register value.
  *
  * @param cmd SPI command byte for payload write
- * @param buf Pointer to the data buffer (must not be NULL)
+ * @param buf Pointer to the data buffer (read-only, must not be NULL)
  * @param count Number of bytes to write
  *
  * @return SPI status register value after the command byte
  */
-static uint8_t zh_nrf24_write_buffer(uint8_t cmd, uint8_t *buf, uint8_t count);
+static uint8_t zh_nrf24_write_buffer(uint8_t cmd, const uint8_t *buf, uint8_t count);
 
 /**
  * @brief Write a single byte to an nRF24L01 register.
@@ -347,12 +383,12 @@ static uint8_t zh_nrf24_write_register(uint8_t reg, uint8_t val);
  * command mask, writes each byte from the buffer, then deasserts CSN.
  *
  * @param reg Register address for the block
- * @param buf Pointer to the data buffer (must not be NULL)
+ * @param buf Pointer to the data buffer (read-only, must not be NULL)
  * @param count Number of bytes to write
  *
  * @return SPI status register value after the command byte
  */
-static uint8_t zh_nrf24_write_buff_register(uint8_t reg, uint8_t *buf, uint8_t count);
+static uint8_t zh_nrf24_write_buff_register(uint8_t reg, const uint8_t *buf, uint8_t count);
 
 /**
  * @brief Send a command to the nRF24L01 without a data payload.
@@ -369,9 +405,12 @@ static uint8_t zh_nrf24_send_command(uint8_t cmd);
 /**
  * @brief Measure the battery voltage using the AVR ADC.
  *
- * Configures the ADC with the internal 1.1 V reference and selects the
- * 1.1 V bandgap input. Takes two conversions and returns the average
- * as a voltage value. Returns zero if the ADC reading is zero.
+ * Configures the ADC with AVcc as the reference and selects the internal
+ * 1.1 V bandgap as the measured input. The ADC result then represents
+ * the AVcc (battery) voltage according to V_bat = 1024 * V_ref / ADC.
+ * Takes two conversions; the first is discarded to let the ADC input
+ * settle, the second result is returned. Returns zero if the ADC
+ * reading is zero.
  *
  * @return Battery voltage in volts
  */
@@ -405,7 +444,7 @@ int main(void)
             transmitted_data.value_2 = (int16_t)lroundf(zh_bme280_compensate_temperature(adc_t) + TEMPERATURE_CALIBRATION);
             transmitted_data.value_3 = (int16_t)lroundf(zh_bme280_compensate_pressure(adc_p) * 0.00750062 + PRESSURE_CALIBRATION);
             transmitted_data.value_1 = (int16_t)lroundf(zh_bme280_compensate_humidity(adc_h) + HUMIDITY_CALIBRATION);
-            zh_nrf24_send((uint8_t *)&transmitted_data, sizeof(transmitted_data));
+            zh_nrf24_send((const uint8_t *)&transmitted_data, sizeof(transmitted_data));
         }
         else
         {
@@ -432,7 +471,7 @@ int main(void)
                     transmitted_data.value_2 = (int16_t)lroundf(zh_bme280_compensate_temperature(adc_t) + TEMPERATURE_CALIBRATION);
                     transmitted_data.value_3 = (int16_t)lroundf(zh_bme280_compensate_pressure(adc_p) * 0.00750062 + PRESSURE_CALIBRATION);
                     transmitted_data.value_1 = (int16_t)lroundf(zh_bme280_compensate_humidity(adc_h) + HUMIDITY_CALIBRATION);
-                    zh_nrf24_send((uint8_t *)&transmitted_data, sizeof(transmitted_data));
+                    zh_nrf24_send((const uint8_t *)&transmitted_data, sizeof(transmitted_data));
                 }
                 else
                 {
@@ -451,7 +490,8 @@ static void zh_wdt_init(void)
     MCUSR &= ~(1 << WDRF);
     WDTCSR |= (1 << WDCE) | (1 << WDE);
     WDTCSR = (1 << WDIE) | (1 << WDP3) | (1 << WDP0);
-    sei();
+    // sei() намеренно не вызывается — глобальные прерывания включает main()
+    // после завершения инициализации всех периферийных модулей.
 }
 
 ISR(WDT_vect)
@@ -497,8 +537,12 @@ static void zh_i2c_stop(void)
 {
     TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);
     uint16_t timeout = 1000;
-    while ((TWCR & (1 << TWSTO)) && --timeout)
+    while ((TWCR & (1 << TWSTO)) != 0)
     {
+        if (--timeout == 0)
+        {
+            break;
+        }
     }
 }
 
@@ -514,24 +558,34 @@ static bool zh_i2c_write(uint8_t data)
     return (status == 0x18 || status == 0x28 || status == 0x40);
 }
 
-static uint8_t zh_i2c_read_ack(void)
+static bool zh_i2c_read_ack(uint8_t *out)
 {
     TWCR = (1 << TWINT) | (1 << TWEN) | (1 << TWEA);
     if (zh_i2c_wait() == false)
     {
-        return 0xFF;
+        return false;
     }
-    return TWDR;
+    if ((TWSR & 0xF8) != 0x50)
+    {
+        return false;
+    }
+    *out = TWDR;
+    return true;
 }
 
-static uint8_t zh_i2c_read_nack(void)
+static bool zh_i2c_read_nack(uint8_t *out)
 {
     TWCR = (1 << TWINT) | (1 << TWEN);
     if (zh_i2c_wait() == false)
     {
-        return 0xFF;
+        return false;
     }
-    return TWDR;
+    if ((TWSR & 0xF8) != 0x58)
+    {
+        return false;
+    }
+    *out = TWDR;
+    return true;
 }
 
 static bool zh_bme280_write_reg(uint8_t reg, uint8_t value)
@@ -563,6 +617,10 @@ static bool zh_bme280_write_reg(uint8_t reg, uint8_t value)
 
 static bool zh_bme280_read_reg(uint8_t reg, uint8_t *buf, uint8_t len)
 {
+    if (buf == 0 || len == 0)
+    {
+        return false;
+    }
     if (zh_i2c_start() == false)
     {
         zh_i2c_stop();
@@ -590,10 +648,33 @@ static bool zh_bme280_read_reg(uint8_t reg, uint8_t *buf, uint8_t len)
     }
     for (uint8_t i = 0; i < len; ++i)
     {
-        buf[i] = (i == len - 1) ? zh_i2c_read_nack() : zh_i2c_read_ack();
+        bool ok;
+        if (i == len - 1)
+        {
+            ok = zh_i2c_read_nack(&buf[i]);
+        }
+        else
+        {
+            ok = zh_i2c_read_ack(&buf[i]);
+        }
+        if (ok == false)
+        {
+            zh_i2c_stop();
+            return false;
+        }
     }
     zh_i2c_stop();
     return true;
+}
+
+static uint16_t zh_read_u16(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static int16_t zh_read_s16(const uint8_t *p)
+{
+    return (int16_t)zh_read_u16(p);
 }
 
 static bool zh_bme280_init(void)
@@ -630,79 +711,137 @@ static bool zh_bme280_init(void)
 
 static bool zh_bme280_read(int32_t *temperature, int32_t *pressure, int32_t *humidity)
 {
+    // 1. ОБЯЗАТЕЛЬНО настраиваем влажность ПЕРЕД запуском измерения температуры/давления
+    // 0x01 = Oversampling x1 для влажности
+    if (zh_bme280_write_reg(BME280_REG_CTRL_HUM, 0x01) == false)
+    {
+        return false;
+    }
+
+    // 2. Включаем Forced mode (0x25: osrs_t x1, osrs_p x1, forced mode)
     if (zh_bme280_write_reg(BME280_REG_CTRL_MEAS, 0x25) == false)
     {
         return false;
     }
-    _delay_ms(10);
+
+    // 3. Ждем окончания измерения. Для x1/x1/x1 по даташиту типичное время ~9.3 мс, 12 мс — с запасом
+    _delay_ms(12);
+
     uint8_t raw[8] = {0};
     if (zh_bme280_read_reg(BME280_REG_DATA, raw, sizeof(raw)) == false)
     {
         return false;
     }
+
+    // 4. Безопасно собираем данные
     *pressure = (int32_t)(((uint32_t)raw[0] << 12) | ((uint32_t)raw[1] << 4) | (raw[2] >> 4));
     *temperature = (int32_t)(((uint32_t)raw[3] << 12) | ((uint32_t)raw[4] << 4) | (raw[5] >> 4));
-    *humidity = (int32_t)(((uint32_t)raw[6] << 8) | (uint32_t)raw[7]);
+
+    // Сначала собираем в беззнаковое 16-битное число, затем расширяем до int32_t
+    uint16_t raw_humidity = ((uint16_t)raw[6] << 8) | raw[7];
+    *humidity = (int32_t)raw_humidity;
+
     return true;
 }
 
 static float zh_bme280_compensate_temperature(int32_t adc_t)
 {
-    int32_t dig_t1 = (int32_t)(uint16_t)(bme280_calib[1] << 8 | bme280_calib[0]);
-    int32_t dig_t2 = (int16_t)(bme280_calib[3] << 8 | bme280_calib[2]);
-    int32_t dig_t3 = (int16_t)(bme280_calib[5] << 8 | bme280_calib[4]);
-    int32_t var1 = ((((adc_t >> 3) - (dig_t1 << 1))) * dig_t2) >> 11;
-    int32_t var2 = (((((adc_t >> 4) - dig_t1) * ((adc_t >> 4) - dig_t1)) >> 12) * dig_t3) >> 14;
+    // 1. Извлекаем калибровку правильно (сборка байтов без нарушения strict aliasing)
+    uint16_t dig_t1 = zh_read_u16(&bme280_calib[0]); // dig_T1 по даташиту UNSIGNED
+    int16_t dig_t2 = zh_read_s16(&bme280_calib[2]);  // SIGNED
+    int16_t dig_t3 = zh_read_s16(&bme280_calib[4]);  // SIGNED
+
+    // 2. Расчет var1
+    int32_t var1 = ((((adc_t >> 3) - ((int32_t)dig_t1 << 1))) * dig_t2) >> 11;
+
+    // 3. Расчет var2 с защитой от переполнения (приведение промежуточного значения к int64_t)
+    int32_t intermediate = (adc_t >> 4) - (int32_t)dig_t1;
+    int32_t var2 = (int32_t)(((((int64_t)intermediate * intermediate) >> 12) * dig_t3) >> 14);
+
+    // 4. Финальный расчет t_fine (обновляем ГЛОБАЛЬНУЮ переменную — она нужна
+    //    компенсаторам давления и влажности; локальная переменная здесь недопустима)
     bme280_t_fine = var1 + var2;
-    return (float)((bme280_t_fine * 5 + 128) >> 8) / 100.0;
+
+    // 5. Расчет и возврат температуры в градусах Цельсия
+    return (float)((bme280_t_fine * 5 + 128) >> 8) / 100.0f;
 }
 
 static float zh_bme280_compensate_pressure(int32_t adc_p)
 {
-    int32_t dig_p1 = (int32_t)(uint16_t)(bme280_calib[7] << 8 | bme280_calib[6]);
-    int32_t dig_p2 = (int16_t)(bme280_calib[9] << 8 | bme280_calib[8]);
-    int32_t dig_p3 = (int16_t)(bme280_calib[11] << 8 | bme280_calib[10]);
-    int32_t dig_p4 = (int16_t)(bme280_calib[13] << 8 | bme280_calib[12]);
-    int32_t dig_p5 = (int16_t)(bme280_calib[15] << 8 | bme280_calib[14]);
-    int32_t dig_p6 = (int16_t)(bme280_calib[17] << 8 | bme280_calib[16]);
-    int32_t dig_p7 = (int16_t)(bme280_calib[19] << 8 | bme280_calib[18]);
-    int32_t dig_p8 = (int16_t)(bme280_calib[21] << 8 | bme280_calib[20]);
-    int32_t dig_p9 = (int16_t)(bme280_calib[23] << 8 | bme280_calib[22]);
-    int32_t var1 = (((int32_t)bme280_t_fine) >> 1) - 64000;
-    int32_t var2 = (((var1 >> 2) * (var1 >> 2)) >> 11) * dig_p6;
-    var2 = var2 + ((var1 * dig_p5) << 1);
-    var2 = (var2 >> 2) + (((int32_t)dig_p4) << 16);
-    var1 = (((dig_p3 * (((var1 >> 2) * (var1 >> 2)) >> 13)) >> 3) + (((int32_t)dig_p2 * var1) >> 1)) >> 18;
-    var1 = ((((32768 + var1)) * dig_p1) >> 15);
+    // 1. Безопасное извлечение коэффициентов из массива калибровки
+    // dig_P1 по даташиту UNSIGNED, остальные SIGNED
+    uint16_t dig_p1 = zh_read_u16(&bme280_calib[6]);
+    int16_t dig_p2 = zh_read_s16(&bme280_calib[8]);
+    int16_t dig_p3 = zh_read_s16(&bme280_calib[10]);
+    int16_t dig_p4 = zh_read_s16(&bme280_calib[12]);
+    int16_t dig_p5 = zh_read_s16(&bme280_calib[14]);
+    int16_t dig_p6 = zh_read_s16(&bme280_calib[16]);
+    int16_t dig_p7 = zh_read_s16(&bme280_calib[18]);
+    int16_t dig_p8 = zh_read_s16(&bme280_calib[20]);
+    int16_t dig_p9 = zh_read_s16(&bme280_calib[22]);
+
+    // 2. Вычисления var1 и var2 с использованием 64-битной математики (защита от переполнения).
+    //    Сдвиг влево отрицательных signed-значений формально является UB — используем
+    //    умножение на (1LL << N), что эквивалентно и не имеет UB.
+    int64_t var1 = ((int64_t)bme280_t_fine) - 128000;
+    int64_t var2 = var1 * var1 * (int64_t)dig_p6;
+    var2 = var2 + ((var1 * (int64_t)dig_p5) * (1LL << 17));
+    var2 = var2 + (((int64_t)dig_p4) * (1LL << 35));
+    var1 = ((var1 * var1 * (int64_t)dig_p3) >> 8) + ((var1 * (int64_t)dig_p2) * (1LL << 12));
+    var1 = (((((int64_t)1) << 47) + var1)) * ((int64_t)dig_p1) >> 33;
+
     if (var1 == 0)
     {
-        return 0.0;
+        return 0.0f; // Защита от деления на ноль
     }
-    uint32_t p = (((uint32_t)(((int32_t)1048576) - adc_p) - (var2 >> 12))) * 3125;
-    if (p < 0x80000000)
-    {
-        p = (p << 1) / ((uint32_t)var1);
-    }
-    else
-    {
-        p = (p / (uint32_t)var1) * 2;
-    }
-    var1 = (((int32_t)dig_p9) * ((int32_t)(((p >> 3) * (p >> 3)) >> 13))) >> 12;
-    var2 = (((int32_t)(p >> 2)) * ((int32_t)dig_p8)) >> 13;
-    return (float)((int32_t)p + ((var1 + var2 + dig_p7) >> 4));
+
+    // 3. Вычисление базового давления
+    int64_t p = 1048576 - adc_p;
+    p = (((p * (1LL << 31)) - var2) * 3125) / var1;
+
+    // 4. Финальная компенсация давления
+    var1 = (((int64_t)dig_p9) * (p >> 13) * (p >> 13)) >> 25;
+    var2 = (((int64_t)dig_p8) * p) >> 19;
+    p = ((p + var1 + var2) >> 8) + (((int64_t)dig_p7) * (1LL << 4));
+
+    // Возвращаем давление в Паскалях (Па)
+    return (float)p / 256.0f;
 }
 
 static float zh_bme280_compensate_humidity(int32_t adc_h)
 {
-    int32_t dig_h1 = bme280_calib[25];
-    int32_t dig_h2 = (int16_t)(bme280_calib[27] << 8 | bme280_calib[26]);
-    int32_t dig_h3 = bme280_calib[28];
-    int32_t dig_h4 = (int16_t)((bme280_calib[29] << 4) | (bme280_calib[30] & 0x0F));
-    int32_t dig_h5 = (int16_t)((bme280_calib[31] << 4) | ((bme280_calib[30] >> 4) & 0x0F));
+    // 1. Безопасное извлечение коэффициентов.
+    // dig_h1 и dig_h3 по даташиту UNSIGNED (uint8_t), dig_h6 - SIGNED (int8_t).
+    // Сборку dig_h4/dig_h5 выполняем через умножение на 16 вместо сдвига влево
+    // отрицательных signed-значений (UB).
+    uint8_t dig_h1 = bme280_calib[25];
+    int16_t dig_h2 = zh_read_s16(&bme280_calib[26]);
+    uint8_t dig_h3 = bme280_calib[28];
+    int16_t dig_h4 = (int16_t)(((int16_t)(int8_t)bme280_calib[29]) * 16 +
+                               (int16_t)(bme280_calib[30] & 0x0F));
+    int16_t dig_h5 = (int16_t)(((int16_t)(int8_t)bme280_calib[31]) * 16 +
+                               (int16_t)((bme280_calib[30] >> 4) & 0x0F));
     int8_t dig_h6 = (int8_t)bme280_calib[32];
+
+    // 2. Вычисления (внедряем int64_t для защиты от переполнения при умножении).
+    //    Левые сдвиги отрицательных signed-значений заменены на умножение на (1LL << N).
     int32_t v_x1_u32r = (bme280_t_fine - ((int32_t)76800));
-    v_x1_u32r = (((((adc_h << 14) - (dig_h4 << 20) - (dig_h5 * v_x1_u32r)) + 16384) >> 15) * (((((((v_x1_u32r * dig_h6) >> 10) * (((v_x1_u32r * dig_h3) >> 11) + 32768)) >> 10) + 2097152) * dig_h2 + 8192) >> 14));
-    v_x1_u32r = (v_x1_u32r - (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) * dig_h1) >> 4));
+
+    int64_t sub_expr1 = ((int64_t)adc_h * (1LL << 14)) -
+                        ((int64_t)dig_h4 * (1LL << 20)) -
+                        ((int64_t)dig_h5 * v_x1_u32r);
+    int64_t sub_expr2 = (((int64_t)v_x1_u32r * dig_h6) >> 10) *
+                        ((((int64_t)v_x1_u32r * dig_h3) >> 11) + 32768);
+    sub_expr2 = ((sub_expr2 >> 10) + 2097152) * (int64_t)dig_h2 + 8192;
+
+    // Соединяем части формулы
+    v_x1_u32r = (int32_t)(((sub_expr1 + 16384) >> 15) * (sub_expr2 >> 14));
+
+    // Вторая часть формулы Bosch
+    int64_t sub_expr3 = ((int64_t)v_x1_u32r >> 15) * ((int64_t)v_x1_u32r >> 15);
+    v_x1_u32r = v_x1_u32r - (int32_t)(((sub_expr3 >> 7) * dig_h1) >> 4);
+
+    // 3. Ограничение диапазонов (по даташиту)
     if (v_x1_u32r < 0)
     {
         v_x1_u32r = 0;
@@ -711,7 +850,9 @@ static float zh_bme280_compensate_humidity(int32_t adc_h)
     {
         v_x1_u32r = 419430400;
     }
-    return (float)(v_x1_u32r >> 12) / 1024.0;
+
+    // 4. Возвращаем значение в % влажности
+    return (float)(v_x1_u32r >> 12) / 1024.0f;
 }
 
 static void zh_spi_init(void)
@@ -733,11 +874,16 @@ static uint8_t zh_spi_transfer(uint8_t data)
 static void zh_nrf24_init(void)
 {
     _delay_ms(100);
-    DDRB |= (1 << PB1);
-    PORTB &= ~(1 << PB1);
-    DDRD &= ~(1 << PD2);
-    PORTD |= (1 << PD2);
-    uint64_t gateway_address = GATEWAY_ADDRESS;
+    DDRB |= (1 << PB1);   // CE as output
+    PORTB &= ~(1 << PB1); // CE low (standby)
+    DDRD &= ~(1 << PD2);  // IRQ as input
+    PORTD |= (1 << PD2);  // pull-up on IRQ (nRF24 IRQ is open-drain active-low)
+
+    /* Адрес шлюза в том порядке, в котором он уходит в эфир. Оригинальный код
+     * (uint64_t с little-endian AVR) отправлял байты FF EE DD. Если шлюз
+     * ожидает DD EE FF, поменяйте порядок байт здесь. */
+    static const uint8_t gateway_addr[3] = {0xFF, 0xEE, 0xDD};
+
     zh_nrf24_write_register(NRF_REG_CONFIG, 0x00);
     zh_nrf24_write_register(NRF_REG_EN_AA, 0x01);
     zh_nrf24_write_register(NRF_REG_EN_RXADDR, 0x01);
@@ -745,16 +891,28 @@ static void zh_nrf24_init(void)
     zh_nrf24_write_register(NRF_REG_SETUP_RETR, 0xFF);
     zh_nrf24_write_register(NRF_REG_RF_CH, GATEWAY_CHANNEL);
     zh_nrf24_write_register(NRF_REG_RF_SETUP, 0x26);
-    zh_nrf24_write_buff_register(NRF_REG_TX_ADDR, (uint8_t *)&gateway_address, 3);
-    zh_nrf24_write_buff_register(NRF_REG_RX_ADDR_P0, (uint8_t *)&gateway_address, 3);
+    zh_nrf24_write_buff_register(NRF_REG_TX_ADDR, gateway_addr, 3);
+    zh_nrf24_write_buff_register(NRF_REG_RX_ADDR_P0, gateway_addr, 3);
     zh_nrf24_write_register(NRF_REG_STATUS, NRF_STATUS_RX_DR | NRF_STATUS_TX_DS | NRF_STATUS_MAX_RT);
     zh_nrf24_write_register(NRF_REG_CONFIG, NRF_CONFIG_MASK_RX_DR | NRF_CONFIG_EN_CRC);
 }
 
-static void zh_nrf24_send(uint8_t *buf, uint8_t size)
+static void zh_nrf24_send(const uint8_t *buf, uint8_t size)
 {
-    zh_nrf24_write_register(NRF_REG_CONFIG, NRF_CONFIG_MASK_RX_DR | NRF_CONFIG_EN_CRC | NRF_CONFIG_PWR_UP);
+    if (buf == 0 || size == 0 || size > 32)
+    {
+        return;
+    }
+
+    zh_nrf24_write_register(NRF_REG_CONFIG,
+                            NRF_CONFIG_MASK_RX_DR | NRF_CONFIG_EN_CRC | NRF_CONFIG_PWR_UP);
     _delay_ms(5);
+
+    // Очищаем старые флаги STATUS, чтобы IRQ не оказалась уже низкой из-за
+    // прошлых событий — иначе цикл ожидания ниже выйдет мгновенно.
+    zh_nrf24_write_register(NRF_REG_STATUS,
+                            NRF_STATUS_RX_DR | NRF_STATUS_TX_DS | NRF_STATUS_MAX_RT);
+
     zh_nrf24_send_command(NRF_CMD_FLUSH_TX);
     zh_nrf24_write_buffer(NRF_CMD_W_TX_PAYLOAD, buf, size);
     PORTB |= (1 << PB1);
@@ -768,13 +926,18 @@ static void zh_nrf24_send(uint8_t *buf, uint8_t size)
         _delay_ms(1);
     }
     PORTB &= ~(1 << PB1);
-    uint8_t status = zh_nrf24_send_command(NRF_CMD_NOP);
-    zh_nrf24_write_register(NRF_REG_STATUS, status);
+
+    // Читаем STATUS (полезно для отладки: NRF_STATUS_TX_DS / NRF_STATUS_MAX_RT),
+    // затем сбрасываем только нужные флаги (write-1-to-clear).
+    (void)zh_nrf24_send_command(NRF_CMD_NOP);
+    zh_nrf24_write_register(NRF_REG_STATUS,
+                            NRF_STATUS_RX_DR | NRF_STATUS_TX_DS | NRF_STATUS_MAX_RT);
+
     zh_nrf24_send_command(NRF_CMD_FLUSH_TX);
     zh_nrf24_write_register(NRF_REG_CONFIG, NRF_CONFIG_MASK_RX_DR | NRF_CONFIG_EN_CRC);
 }
 
-static uint8_t zh_nrf24_write_buffer(uint8_t cmd, uint8_t *buf, uint8_t count)
+static uint8_t zh_nrf24_write_buffer(uint8_t cmd, const uint8_t *buf, uint8_t count)
 {
     PORTB &= ~(1 << PB2);
     uint8_t status = zh_spi_transfer(cmd);
@@ -795,7 +958,7 @@ static uint8_t zh_nrf24_write_register(uint8_t reg, uint8_t val)
     return status;
 }
 
-static uint8_t zh_nrf24_write_buff_register(uint8_t reg, uint8_t *buf, uint8_t count)
+static uint8_t zh_nrf24_write_buff_register(uint8_t reg, const uint8_t *buf, uint8_t count)
 {
     return zh_nrf24_write_buffer((reg | NRF_CMD_W_REGISTER), buf, count);
 }
@@ -810,6 +973,8 @@ static uint8_t zh_nrf24_send_command(uint8_t cmd)
 
 static float zh_get_battery_voltage(void)
 {
+    // AVcc как опора + внутренний bandgap 1.1 В как вход.
+    // Результат ADC = 1024 * 1.1 / V_avcc, поэтому V_avcc = 1024 * 1.1 / ADC.
     ADMUX = (1 << REFS0) | (1 << MUX3) | (1 << MUX2) | (1 << MUX1);
     ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
     _delay_ms(10);
